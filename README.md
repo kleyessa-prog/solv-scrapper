@@ -1,22 +1,29 @@
-# Solvhealth Scraper (Python)
+# Patient Form Data Capture
 
-A Python-based Playwright web scraper for extracting data from [Solvhealth Management Portal](https://manage.solvhealth.com/).
+A Python-based Playwright script that monitors the Solvhealth queue page and automatically captures patient form data when forms are submitted.
+
+## Purpose
+
+This project captures patient form data in real-time when the "Add Patient" form is submitted on the Solvhealth management portal. It automatically:
+
+- Monitors for form submissions
+- Captures all form field data (name, phone, DOB, reason for visit, etc.)
+- Tracks EMR ID assignment from API responses
+- Saves data to JSON file and PostgreSQL database
 
 ## Features
 
-- Extracts comprehensive page data including:
-  - Page title and metadata
-  - All links and their destinations
-  - Headings (h1-h6)
-  - Form elements and inputs
-  - Tables with headers and rows
-  - Buttons and interactive elements
-  - Images with alt text and sources
-  - Full page text content
-- Automatic login with credentials
-- Takes full-page screenshots for reference
-- Saves data in structured JSON format
-- Supports both visible and headless browser modes
+- **Real-time Form Monitoring**: Automatically detects when patient forms are submitted
+- **Complete Data Capture**: Captures all form fields including:
+  - Legal first name and last name
+  - Mobile phone
+  - Date of birth
+  - Reason for visit
+  - Sex at birth
+  - Location information
+- **EMR ID Tracking**: Monitors API responses to capture EMR IDs when assigned
+- **Data Storage**: Saves to both JSON file (`patient_data.json`) and PostgreSQL database
+- **Location Management**: Supports multiple locations via location mapping
 
 ## Installation
 
@@ -29,118 +36,129 @@ pip install -r requirements.txt
 2. **Install Playwright browsers:**
 
 ```bash
-playwright install
+playwright install chromium
 ```
 
-Or install only Chromium:
+3. **Set up database (optional):**
+
+Create a `.env` file with database credentials:
+
+```env
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=solvhealth_patients
+DB_USER=postgres
+DB_PASSWORD=your_password
+```
+
+Then run the database schema:
 
 ```bash
-playwright install chromium
+psql -U postgres -d solvhealth_patients -f db_schema.sql
 ```
 
 ## Usage
 
-### Basic Usage
+### Quick Start - Run Everything Together
 
-Run the scraper with visible browser (recommended for first run):
-
-```bash
-python scraper.py
-```
-
-### Headless Mode
-
-Run in headless mode (faster, no browser window):
+**Run both the monitor and API server simultaneously:**
 
 ```bash
-python scraper.py --headless
+export SOLVHEALTH_QUEUE_URL="https://manage.solvhealth.com/queue?location_ids=AXjwbE"
+python run_all.py
 ```
 
-### Fast Mode (No Slow Motion)
+This will:
+1. Start the API server on `http://localhost:8000`
+2. Start the patient form monitor
+3. Both run concurrently and can be stopped with Ctrl+C
 
-By default, the scraper slows down operations for visibility. To run faster:
+### Basic Usage - Monitor Only
+
+Run the form monitor (opens browser window):
 
 ```bash
-python scraper.py --headless --no-slow
+python monitor_patient_form.py
 ```
 
-### Command Line Options
+The script will:
+1. Open a browser window and navigate to the Solvhealth queue page
+2. Set up form monitoring
+3. Wait for you to submit patient forms
+4. Automatically capture and save form data when forms are submitted
 
-- `--headless`: Run browser in headless mode
-- `--no-slow`: Disable slow motion (faster execution)
-- `-h, --help`: Show help message
+### Instructions
+
+1. Click 'Add Patient' button (modal will open)
+2. Select location from dropdown in the modal
+3. Fill out the form fields that appear
+4. Click 'Add' button to submit
+5. Form data will be captured and saved automatically
 
 ## Output
 
-The scraper creates two directories:
+### JSON File
 
-1. **`scraped-data/`** - Contains JSON files with all extracted data
-   - Format: `solvhealth-{timestamp}.json`
-   - Includes all page elements, links, forms, tables, etc.
-
-2. **`screenshots/`** - Contains full-page screenshots
-   - `solvhealth-homepage.png` - Main page screenshot
-   - `error-{timestamp}.png` - Screenshot on errors (if any)
-
-## Example Output Structure
+Patient data is saved to `patient_data.json` in JSON format:
 
 ```json
-{
-  "url": "https://manage.solvhealth.com/",
-  "timestamp": "2024-11-04T...",
-  "title": "Page Title",
-  "links": [...],
-  "headings": [...],
-  "forms": [...],
-  "tables": [...],
-  "buttons": [...],
-  "images": [...],
-  "textContent": "...",
-  "meta": {...}
-}
+[
+  {
+    "location_id": "AXjwbE",
+    "location_name": "Exer Urgent Care - Demo",
+    "legalFirstName": "John",
+    "legalLastName": "Doe",
+    "mobilePhone": "(555) 123-4567",
+    "dob": "01/15/1990",
+    "reasonForVisit": "General checkup",
+    "sexAtBirth": "Male",
+    "emr_id": "12345",
+    "captured_at": "2024-01-15T10:30:00"
+  }
+]
 ```
+
+### Database
+
+If configured, data is also saved to PostgreSQL database in the `patients` table.
 
 ## Requirements
 
 - Python 3.8+
 - Playwright for Python
-- Playwright browsers (installed with `playwright install`)
+- PostgreSQL (optional, for database storage)
+- psycopg2-binary (optional, for database support)
 
 ## Configuration
 
-Login credentials are hardcoded in `scraper.py`. To change them, edit the following lines:
+### Location
 
-```python
-email = "cdavis@catalyzelabs.com"
-password = "MT#r6nF!!Ez6iRz"
+**Required**: The location must be specified via the `SOLVHEALTH_QUEUE_URL` environment variable with a `location_ids` parameter:
+
+```bash
+export SOLVHEALTH_QUEUE_URL="https://manage.solvhealth.com/queue?location_ids=AXjwbE"
+python3 monitor_patient_form.py
 ```
 
-For better security, consider using environment variables:
-
-```python
-import os
-email = os.getenv("SOLVHEALTH_EMAIL", "cdavis@catalyzelabs.com")
-password = os.getenv("SOLVHEALTH_PASSWORD", "MT#r6nF!!Ez6iRz")
-```
-
-## Notes
-
-- The scraper automatically detects and handles login
-- It waits for pages to fully load before extracting data
-- Some sites may have anti-scraping measures; adjust as needed
-- Respect the site's `robots.txt` and terms of service
-- The scraper uses Chromium by default
+The script will extract the `location_ids` parameter from the URL. See `locations.py` for all available locations.
 
 ## Troubleshooting
 
-If you encounter issues:
+1. **Browser not opening**: Make sure Playwright browsers are installed with `playwright install chromium`
+2. **Form data not captured**: Check browser console for JavaScript errors
+3. **Database errors**: Ensure PostgreSQL is running and credentials in `.env` are correct
+4. **EMR ID not captured**: EMR IDs are captured from API responses; they may take a few seconds to appear
 
-1. **Browsers not installed**: Run `playwright install`
-2. **Timeout errors**: The scraper has generous timeouts, but slow networks may need adjustment
-3. **Login failures**: Check credentials and network connectivity
-4. **Import errors**: Ensure all dependencies are installed with `pip install -r requirements.txt`
+## Files
+
+- `run_all.py` - **Run both monitor and API server together** (recommended)
+- `monitor_patient_form.py` - Main script for form monitoring
+- `api.py` - FastAPI server to access patient data
+- `save_to_db.py` - Database saving utilities
+- `locations.py` - Location ID to name mapping
+- `db_schema.sql` - Database schema
+- `patient_data.json` - Output file for captured form data
 
 ## License
 
 ISC
-

@@ -32,9 +32,11 @@ playwright-report/
 blob-report/
 .playwright/
 
-# Scraper outputs
-scraped-data/
-screenshots/
+# Browser data
+.browser-data/
+
+# Logs
+*.log
 
 # IDE
 .vscode/

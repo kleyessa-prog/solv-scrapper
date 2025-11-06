@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
 """
-FastAPI REST API for patient data.
+FastAPI application to expose patient data via REST API.
 """
 
 import os
-from typing import Optional, Dict, Any
+import sys
 from datetime import datetime
+from typing import Optional, Dict, Any
+from pathlib import Path
 
 try:
-    from fastapi import FastAPI, HTTPException, status
+    from fastapi import FastAPI, HTTPException
     from fastapi.responses import JSONResponse
-    from pydantic import BaseModel
-except ImportError:
-    print("Error: FastAPI is not installed. Please run: pip install -r requirements.txt")
-    exit(1)
-
-try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
 except ImportError:
-    print("Error: psycopg2-binary is not installed. Please run: pip install -r requirements.txt")
-    exit(1)
+    print("Error: Required packages not installed. Please run: pip install -r requirements.txt")
+    sys.exit(1)
 
 try:
     from dotenv import load_dotenv
@@ -28,50 +24,22 @@ try:
 except ImportError:
     pass  # dotenv is optional
 
-
-# Initialize FastAPI app
 app = FastAPI(
     title="Patient Data API",
-    description="REST API for accessing patient data from PostgreSQL database",
+    description="API to access patient records from the database",
     version="1.0.0"
 )
 
 
-# Pydantic models for response
-class PatientResponse(BaseModel):
-    id: int
-    patient_id: Optional[str]
-    solv_id: Optional[str]
-    emr_id: Optional[str]
-    location_id: Optional[str]
-    location_name: Optional[str]
-    legal_first_name: Optional[str]
-    legal_last_name: Optional[str]
-    first_name: Optional[str]
-    last_name: Optional[str]
-    mobile_phone: Optional[str]
-    dob: Optional[str]
-    date_of_birth: Optional[str]
-    reason_for_visit: Optional[str]
-    sex_at_birth: Optional[str]
-    gender: Optional[str]
-    room: Optional[str]
-    captured_at: Optional[datetime]
-    created_at: Optional[datetime]
-    updated_at: Optional[datetime]
-    raw_data: Optional[Dict[str, Any]]
-
-    class Config:
-        from_attributes = True
-
-
 def get_db_connection():
     """Get PostgreSQL database connection from environment variables."""
+    import getpass
+    default_user = os.getenv('USER', os.getenv('USERNAME', getpass.getuser()))
     db_config = {
         'host': os.getenv('DB_HOST', 'localhost'),
         'port': os.getenv('DB_PORT', '5432'),
         'database': os.getenv('DB_NAME', 'solvhealth_patients'),
-        'user': os.getenv('DB_USER', 'postgres'),
+        'user': os.getenv('DB_USER', default_user),
         'password': os.getenv('DB_PASSWORD', '')
     }
     
@@ -80,14 +48,24 @@ def get_db_connection():
         return conn
     except psycopg2.Error as e:
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            status_code=500,
             detail=f"Database connection error: {str(e)}"
         )
 
 
-def get_db_cursor(conn):
-    """Get a database cursor that returns dict-like rows."""
-    return conn.cursor(cursor_factory=RealDictCursor)
+def format_patient_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Format patient record for JSON response."""
+    formatted = {}
+    for key, value in record.items():
+        # Convert datetime objects to ISO format strings
+        if isinstance(value, datetime):
+            formatted[key] = value.isoformat()
+        # Convert date objects to ISO format strings
+        elif hasattr(value, 'isoformat') and hasattr(value, 'year'):
+            formatted[key] = value.isoformat()
+        else:
+            formatted[key] = value
+    return formatted
 
 
 @app.get("/")
@@ -97,36 +75,33 @@ async def root():
         "message": "Patient Data API",
         "version": "1.0.0",
         "endpoints": {
-            "GET /patient/{emr_id}": "Get patient record by EMR ID",
-            "GET /docs": "API documentation (Swagger UI)",
-            "GET /redoc": "Alternative API documentation (ReDoc)"
+            "GET /patient/{emr_id}": "Get patient record by EMR ID"
         }
     }
 
 
-@app.get("/patient/{emr_id}", response_model=PatientResponse)
+@app.get("/patient/{emr_id}")
 async def get_patient_by_emr_id(emr_id: str):
     """
     Get a patient record by EMR ID.
     
+    Returns the most recent patient record matching the given EMR ID.
+    If multiple records exist, returns the one with the latest captured_at timestamp.
+    
     Args:
-        emr_id: The EMR (Electronic Medical Record) ID of the patient
-    
+        emr_id: The EMR ID of the patient to retrieve
+        
     Returns:
-        Patient record with all fields
-    
-    Raises:
-        404: If patient with the given EMR ID is not found
-        503: If database connection fails
+        Patient record as JSON, or 404 if not found
     """
     conn = None
     cursor = None
     
     try:
         conn = get_db_connection()
-        cursor = get_db_cursor(conn)
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         
-        # Query patient by EMR ID
+        # Query for the most recent patient record with the given emr_id
         query = """
             SELECT 
                 id, patient_id, solv_id, emr_id, location_id, location_name,
@@ -136,44 +111,36 @@ async def get_patient_by_emr_id(emr_id: str):
                 raw_data
             FROM patients
             WHERE emr_id = %s
-            ORDER BY created_at DESC
-            LIMIT 1
+            ORDER BY captured_at DESC
+            LIMIT 1;
         """
         
         cursor.execute(query, (emr_id,))
-        patient = cursor.fetchone()
+        record = cursor.fetchone()
         
-        if not patient:
+        if not record:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
+                status_code=404,
                 detail=f"Patient with EMR ID '{emr_id}' not found"
             )
         
-        # Convert date_of_birth to string if it exists
-        patient_dict = dict(patient)
-        if patient_dict.get('date_of_birth'):
-            patient_dict['date_of_birth'] = patient_dict['date_of_birth'].isoformat()
+        # Convert to regular dict and format
+        patient_data = dict(record)
+        formatted_patient = format_patient_record(patient_data)
         
-        # Parse raw_data JSON if it exists
-        if patient_dict.get('raw_data') and isinstance(patient_dict['raw_data'], str):
-            try:
-                import json
-                patient_dict['raw_data'] = json.loads(patient_dict['raw_data'])
-            except:
-                pass
-        
-        return PatientResponse(**patient_dict)
+        return JSONResponse(content=formatted_patient)
         
     except HTTPException:
+        # Re-raise HTTP exceptions
         raise
     except psycopg2.Error as e:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=500,
             detail=f"Database error: {str(e)}"
         )
     except Exception as e:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=500,
             detail=f"Internal server error: {str(e)}"
         )
     finally:
@@ -183,45 +150,11 @@ async def get_patient_by_emr_id(emr_id: str):
             conn.close()
 
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint to verify database connectivity."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1")
-        cursor.close()
-        conn.close()
-        return {
-            "status": "healthy",
-            "database": "connected"
-        }
-    except Exception as e:
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={
-                "status": "unhealthy",
-                "database": "disconnected",
-                "error": str(e)
-            }
-        )
-
-
 if __name__ == "__main__":
     import uvicorn
     
-    # Get port from environment or default to 8000
-    port = int(os.getenv('API_PORT', 8000))
+    port = int(os.getenv('API_PORT', '8000'))
     host = os.getenv('API_HOST', '0.0.0.0')
     
-    print(f"Starting Patient Data API on http://{host}:{port}")
-    print(f"API Documentation: http://{host}:{port}/docs")
-    
-    uvicorn.run(
-        "api:app",
-        host=host,
-        port=port,
-        reload=True  # Enable auto-reload during development
-    )
+    uvicorn.run(app, host=host, port=port)
 

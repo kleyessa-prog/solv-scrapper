@@ -75,10 +75,6 @@ LOCATION_MAP = {
 # Reverse mapping: location ID to location name
 LOCATION_ID_TO_NAME = {v: k for k, v in LOCATION_MAP.items()}
 
-# Default location (Demo)
-DEFAULT_LOCATION_ID = "AXjwbE"
-DEFAULT_LOCATION_NAME = "Exer Urgent Care - Demo"
-
 
 def get_location_id(location_name):
     """
@@ -111,11 +107,11 @@ def get_queue_url(location_id=None, location_name=None):
     Get queue URL for a location.
     
     Args:
-        location_id: Location ID string (optional)
-        location_name: Location name string (optional)
+        location_id: Location ID string (required if location_name not provided)
+        location_name: Location name string (required if location_id not provided)
     
     Returns:
-        Queue URL string
+        Queue URL string, or None if neither location_id nor location_name is provided
     
     Examples:
         >>> get_queue_url(location_id="AXjwbE")
@@ -131,8 +127,8 @@ def get_queue_url(location_id=None, location_name=None):
         if loc_id:
             return f"https://manage.solvhealth.com/queue?location_ids={loc_id}"
     
-    # Default to Demo location
-    return f"https://manage.solvhealth.com/queue?location_ids={DEFAULT_LOCATION_ID}"
+    # No default - return None if no location provided
+    return None
 
 
 def list_all_locations():

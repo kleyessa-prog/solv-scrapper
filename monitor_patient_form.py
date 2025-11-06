@@ -7,14 +7,31 @@ patient form data when the "Add Patient" button is clicked and the form is submi
 
 import asyncio
 import json
-import re
+import os
+import sys
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+from typing import Dict, Any, Optional
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-from locations import LOCATION_ID_TO_NAME, DEFAULT_LOCATION_ID
+from locations import LOCATION_ID_TO_NAME
+
+# Import database functions
+try:
+    import psycopg2
+    from psycopg2.extras import execute_values
+    DB_AVAILABLE = True
+except ImportError:
+    DB_AVAILABLE = False
+    print("⚠️  psycopg2-binary not installed. Database saving will be disabled.")
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv is optional
 
 
 def extract_location_id_from_url(url):
@@ -51,6 +68,256 @@ def get_location_name(location_id):
         Location name string, or "Unknown Location" if not found
     """
     return LOCATION_ID_TO_NAME.get(location_id, f"Unknown Location ({location_id})")
+
+
+def get_db_connection():
+    """Get PostgreSQL database connection from environment variables."""
+    if not DB_AVAILABLE:
+        return None
+    
+    db_config = {
+        'host': os.getenv('DB_HOST', 'localhost'),
+        'port': os.getenv('DB_PORT', '5432'),
+        'database': os.getenv('DB_NAME', 'solvhealth_patients'),
+        'user': os.getenv('DB_USER', 'postgres'),
+        'password': os.getenv('DB_PASSWORD', '')
+    }
+    
+    try:
+        conn = psycopg2.connect(**db_config)
+        return conn
+    except psycopg2.Error as e:
+        print(f"   ⚠️  Database connection error: {e}")
+        return None
+
+
+def normalize_date(date_str: str) -> Optional[str]:
+    """Normalize date string to YYYY-MM-DD format."""
+    if not date_str or date_str.strip() == '':
+        return None
+    
+    date_str = date_str.strip()
+    
+    # Try to parse various date formats
+    formats = [
+        '%Y-%m-%d',
+        '%m/%d/%Y',
+        '%m-%d-%Y',
+        '%d/%m/%Y',
+        '%d-%m-%Y',
+    ]
+    
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(date_str, fmt)
+            return dt.strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+    
+    return None
+
+
+def normalize_timestamp(timestamp_str: str) -> Optional[datetime]:
+    """Normalize timestamp string to datetime object."""
+    if not timestamp_str or timestamp_str.strip() == '':
+        return None
+    
+    timestamp_str = timestamp_str.strip()
+    
+    # Try ISO format first
+    try:
+        return datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+    except ValueError:
+        pass
+    
+    # Try other common formats
+    formats = [
+        '%Y-%m-%dT%H:%M:%S.%f',
+        '%Y-%m-%dT%H:%M:%S',
+        '%Y-%m-%d %H:%M:%S',
+    ]
+    
+    for fmt in formats:
+        try:
+            return datetime.strptime(timestamp_str, fmt)
+        except ValueError:
+            continue
+    
+    return None
+
+
+def normalize_patient_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize patient record from JSON to database format."""
+    normalized = {
+        'patient_id': record.get('patientId') or record.get('patient_id') or None,
+        'solv_id': record.get('solvId') or record.get('solv_id') or None,
+        'emr_id': record.get('emrId') or record.get('emr_id') or record.get('emr_id') or None,
+        'location_id': record.get('locationId') or record.get('location_id') or None,
+        'location_name': record.get('location_name') or record.get('locationName') or None,
+        'legal_first_name': record.get('legalFirstName') or record.get('legal_first_name') or None,
+        'legal_last_name': record.get('legalLastName') or record.get('legal_last_name') or None,
+        'first_name': record.get('firstName') or record.get('first_name') or 
+                     record.get('legalFirstName') or record.get('legal_first_name') or None,
+        'last_name': record.get('lastName') or record.get('last_name') or 
+                    record.get('legalLastName') or record.get('legal_last_name') or None,
+        'mobile_phone': record.get('mobilePhone') or record.get('mobile_phone') or 
+                       record.get('phone') or None,
+        'dob': record.get('dob') or record.get('dateOfBirth') or record.get('date_of_birth') or None,
+        'date_of_birth': None,  # Will be set from normalized dob
+        'reason_for_visit': record.get('reasonForVisit') or record.get('reason_for_visit') or 
+                           record.get('reason') or None,
+        'sex_at_birth': record.get('sexAtBirth') or record.get('sex_at_birth') or None,
+        'gender': record.get('gender') or record.get('sex') or 
+                 record.get('sexAtBirth') or record.get('sex_at_birth') or None,
+        'room': record.get('room') or record.get('roomNumber') or record.get('room_number') or None,
+        'captured_at': normalize_timestamp(record.get('captured_at') or record.get('capturedAt')) or datetime.now(),
+        'raw_data': json.dumps(record)
+    }
+    
+    # Normalize date of birth
+    if normalized['dob']:
+        normalized['date_of_birth'] = normalize_date(normalized['dob'])
+    
+    # Clean up empty strings to None
+    for key, value in normalized.items():
+        if value == '':
+            normalized[key] = None
+    
+    return normalized
+
+
+def ensure_db_tables_exist(conn):
+    """Ensure database tables exist, create them if they don't."""
+    if not conn:
+        return False
+    
+    try:
+        schema_file = Path(__file__).parent / 'db_schema.sql'
+        
+        if not schema_file.exists():
+            print(f"   ⚠️  Schema file not found: {schema_file}")
+            return False
+        
+        with open(schema_file, 'r') as f:
+            schema_sql = f.read()
+        
+        # Remove CREATE DATABASE command if present (we're already connected)
+        schema_sql = schema_sql.replace('CREATE DATABASE', '-- CREATE DATABASE')
+        schema_sql = schema_sql.replace('\\c', '-- \\c')
+        
+        cursor = conn.cursor()
+        cursor.execute(schema_sql)
+        conn.commit()
+        cursor.close()
+        return True
+    except Exception as e:
+        # Table might already exist, which is fine
+        if 'already exists' in str(e).lower() or 'duplicate' in str(e).lower():
+            return True
+        print(f"   ⚠️  Error ensuring tables exist: {e}")
+        conn.rollback()
+        return False
+
+
+def save_patient_to_db(patient_data: Dict[str, Any], on_conflict: str = 'update') -> bool:
+    """
+    Save a single patient record to PostgreSQL database.
+    
+    Args:
+        patient_data: Dictionary with patient data
+        on_conflict: What to do on conflict ('ignore' or 'update')
+    
+    Returns:
+        True if saved successfully, False otherwise
+    """
+    if not DB_AVAILABLE:
+        return False
+    
+    conn = get_db_connection()
+    if not conn:
+        return False
+    
+    try:
+        # Ensure tables exist
+        ensure_db_tables_exist(conn)
+        
+        normalized = normalize_patient_record(patient_data)
+        
+        cursor = conn.cursor()
+        
+        insert_query = """
+            INSERT INTO patients (
+                patient_id, solv_id, emr_id, location_id, location_name,
+                legal_first_name, legal_last_name, first_name, last_name,
+                mobile_phone, dob, date_of_birth, reason_for_visit,
+                sex_at_birth, gender, room, captured_at, raw_data
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        
+        if on_conflict == 'ignore':
+            insert_query += """
+                ON CONFLICT (patient_id, location_id, captured_at) DO NOTHING
+            """
+        elif on_conflict == 'update':
+            insert_query += """
+                ON CONFLICT (patient_id, location_id, captured_at) DO UPDATE SET
+                    solv_id = EXCLUDED.solv_id,
+                    emr_id = EXCLUDED.emr_id,
+                    location_name = EXCLUDED.location_name,
+                    legal_first_name = EXCLUDED.legal_first_name,
+                    legal_last_name = EXCLUDED.legal_last_name,
+                    first_name = EXCLUDED.first_name,
+                    last_name = EXCLUDED.last_name,
+                    mobile_phone = EXCLUDED.mobile_phone,
+                    dob = EXCLUDED.dob,
+                    date_of_birth = EXCLUDED.date_of_birth,
+                    reason_for_visit = EXCLUDED.reason_for_visit,
+                    sex_at_birth = EXCLUDED.sex_at_birth,
+                    gender = EXCLUDED.gender,
+                    room = EXCLUDED.room,
+                    raw_data = EXCLUDED.raw_data,
+                    updated_at = CURRENT_TIMESTAMP
+            """
+        
+        values = (
+            normalized['patient_id'],
+            normalized['solv_id'],
+            normalized['emr_id'],
+            normalized['location_id'],
+            normalized['location_name'],
+            normalized['legal_first_name'],
+            normalized['legal_last_name'],
+            normalized['first_name'],
+            normalized['last_name'],
+            normalized['mobile_phone'],
+            normalized['dob'],
+            normalized['date_of_birth'],
+            normalized['reason_for_visit'],
+            normalized['sex_at_birth'],
+            normalized['gender'],
+            normalized['room'],
+            normalized['captured_at'],
+            normalized['raw_data']
+        )
+        
+        cursor.execute(insert_query, values)
+        conn.commit()
+        cursor.close()
+        
+        emr_status = f" (EMR ID: {normalized['emr_id']})" if normalized['emr_id'] else " (no EMR ID yet)"
+        print(f"   💾 Saved to database{emr_status}")
+        return True
+        
+    except psycopg2.Error as e:
+        conn.rollback()
+        print(f"   ⚠️  Database error: {e}")
+        return False
+    except Exception as e:
+        print(f"   ⚠️  Error saving to database: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
 
 
 async def capture_form_data(page):
@@ -308,6 +575,9 @@ async def save_patient_data(data, output_file="patient_data.json"):
         print(f"   📄 File: {output_path}")
         print(f"   📊 Total entries: {len(data_to_save)}")
         
+        # Save to database after writing to JSON
+        save_patient_to_db(data, on_conflict='update')
+        
     except Exception as e:
         print(f"❌ Error saving patient data: {e}")
         import traceback
@@ -338,7 +608,10 @@ async def setup_form_monitor(page, location_id, location_name):
         # Re-extract location_id from current URL in case user changed location
         current_url = page.url
         current_location_id = extract_location_id_from_url(current_url) or location_id
-        current_location_name = get_location_name(current_location_id)
+        if current_location_id:
+            current_location_name = get_location_name(current_location_id) or f"Location {current_location_id}"
+        else:
+            current_location_name = "Unknown Location"
         
         print(f"   Location ID: {current_location_id}")
         print(f"   Location: {current_location_name}")
@@ -496,6 +769,9 @@ async def setup_form_monitor(page, location_id, location_name):
                 with open(output_path, 'w', encoding='utf-8') as f:
                     json.dump(existing_data, f, indent=2, ensure_ascii=False)
                 print(f"   ✅ Updated JSON file with EMR ID")
+                
+                # Save to database with updated EMR ID
+                save_patient_to_db(patient_data, on_conflict='update')
             else:
                 print(f"   ⚠️  Could not find matching patient entry to update")
                 
@@ -1243,11 +1519,26 @@ async def main():
     """
     Main function to run the patient form monitor.
     """
-    url = "https://manage.solvhealth.com/queue?location_ids=AXjwbE"
+    # Get URL from environment variable - must include location_ids parameter
+    url = os.getenv('SOLVHEALTH_QUEUE_URL')
+    
+    if not url:
+        print("❌ Error: SOLVHEALTH_QUEUE_URL environment variable is not set.")
+        print("   Please set it with a URL that includes location_ids parameter, e.g.:")
+        print("   export SOLVHEALTH_QUEUE_URL='https://manage.solvhealth.com/queue?location_ids=AXjwbE'")
+        sys.exit(1)
     
     # Extract location_id from URL
-    location_id = extract_location_id_from_url(url) or DEFAULT_LOCATION_ID
-    location_name = get_location_name(location_id)
+    location_id = extract_location_id_from_url(url)
+    
+    if not location_id:
+        print("❌ Error: No location_id found in URL.")
+        print(f"   URL provided: {url}")
+        print("   Please provide a URL with location_ids parameter, e.g.:")
+        print("   https://manage.solvhealth.com/queue?location_ids=AXjwbE")
+        sys.exit(1)
+    
+    location_name = get_location_name(location_id) or f"Location {location_id}"
     
     print("=" * 60)
     print("🏥 Patient Form Monitor")
