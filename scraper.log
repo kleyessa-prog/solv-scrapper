@@ -1,0 +1,4 @@
+  File "/Users/biruktsegaye/Documents/playwright-test-python/scraper.py", line 656
+    except Exception:
+    ^^^^^^
+SyntaxError: invalid syntax

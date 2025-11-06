@@ -1,0 +1,1318 @@
+#!/usr/bin/env python3
+"""
+Patient Form Monitor
+A background Playwright script that monitors the Solvhealth queue page and captures
+patient form data when the "Add Patient" button is clicked and the form is submitted.
+"""
+
+import asyncio
+import json
+import re
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+
+from locations import LOCATION_ID_TO_NAME, DEFAULT_LOCATION_ID
+
+
+def extract_location_id_from_url(url):
+    """
+    Extract location_ids query parameter from URL.
+    
+    Args:
+        url: Full URL string
+    
+    Returns:
+        Location ID string, or None if not found
+    """
+    try:
+        parsed = urlparse(url)
+        query_params = parse_qs(parsed.query)
+        location_ids = query_params.get('location_ids', [])
+        if location_ids:
+            # location_ids can be a list, get the first one
+            return location_ids[0] if isinstance(location_ids, list) else location_ids
+        return None
+    except Exception as e:
+        print(f"⚠️  Error extracting location_id from URL: {e}")
+        return None
+
+
+def get_location_name(location_id):
+    """
+    Get location name from location ID using the mapping.
+    
+    Args:
+        location_id: Location ID string
+    
+    Returns:
+        Location name string, or "Unknown Location" if not found
+    """
+    return LOCATION_ID_TO_NAME.get(location_id, f"Unknown Location ({location_id})")
+
+
+async def capture_form_data(page):
+    """
+    Capture all form field values from the patient modal.
+    
+    Args:
+        page: Playwright page object
+    
+    Returns:
+        Dictionary with captured form data
+    """
+    form_data = {}
+    
+    try:
+        # Wait for the modal to be visible
+        # The modal might have various selectors, try common ones
+        modal_selectors = [
+            '[role="dialog"]',
+            '.modal',
+            '[data-testid*="modal"]',
+            '[class*="Modal"]',
+        ]
+        
+        modal_visible = False
+        for selector in modal_selectors:
+            try:
+                await page.wait_for_selector(selector, timeout=2000, state="visible")
+                modal_visible = True
+                break
+            except PlaywrightTimeoutError:
+                continue
+        
+        if not modal_visible:
+            print("⚠️  Modal not found, trying to capture data anyway...")
+        
+        # Capture text input fields - using actual field names from HTML
+        field_mappings = [
+            {
+                'key': 'legalFirstName',
+                'selectors': [
+                    '[name="firstName"]',
+                    '[data-testid="addPatientFirstName"]',
+                    'input[name="firstName"]',
+                    'input[data-testid="addPatientFirstName"]'
+                ]
+            },
+            {
+                'key': 'legalLastName',
+                'selectors': [
+                    '[name="lastName"]',
+                    '[data-testid="addPatientLastName"]',
+                    'input[name="lastName"]',
+                    'input[data-testid="addPatientLastName"]'
+                ]
+            },
+            {
+                'key': 'mobilePhone',
+                'selectors': [
+                    '[data-testid="addPatientMobilePhone"]',
+                    '[name="phone"]',
+                    'input[type="tel"][data-testid*="Phone"]',
+                    'input[data-testid="addPatientMobilePhone"]'
+                ]
+            },
+            {
+                'key': 'dob',
+                'selectors': [
+                    '[data-testid="addPatientDob"]',
+                    '[name="birthDate"]',
+                    'input[placeholder*="MM/DD/YYYY"]',
+                    'input[data-testid="addPatientDob"]'
+                ]
+            },
+            {
+                'key': 'reasonForVisit',
+                'selectors': [
+                    '[name="reasonForVisit"]',
+                    '[data-testid*="addPatientReasonForVisit"]',
+                    '[id="reasonForVisit"]',
+                    '[data-testid="addPatientReasonForVisit-0"]',
+                    'input[name="reasonForVisit"]',
+                    'input[id="reasonForVisit"]'
+                ]
+            }
+        ]
+        
+        for field in field_mappings:
+            try:
+                value = None
+                for selector in field['selectors']:
+                    try:
+                        element = await page.query_selector(selector)
+                        if element:
+                            value = await element.input_value()
+                            if value and value.strip():
+                                break
+                    except Exception:
+                        continue
+                
+                form_data[field['key']] = value or ""
+            except Exception as e:
+                print(f"⚠️  Error capturing {field['key']}: {e}")
+                form_data[field['key']] = ""
+        
+        # Capture dropdown/select field (sexAtBirth) - using actual field name "birthSex"
+        try:
+            sex_selectors = [
+                '#birthSex',
+                '[id="birthSex"]',
+                '[name="birthSex"]',
+                '[data-testid*="birthSex"]',
+                'select[name="birthSex"]',
+                'select[id="birthSex"]',
+            ]
+            
+            sex_value = None
+            for selector in sex_selectors:
+                try:
+                    element = await page.query_selector(selector)
+                    if element:
+                        # Check if it's a select element
+                        tag_name = await element.evaluate('el => el.tagName.toLowerCase()')
+                        if tag_name == 'select':
+                            sex_value = await element.evaluate('el => el.value')
+                        else:
+                            # For Ant Design custom dropdown, get the selected value
+                            sex_value = await element.evaluate("""
+                                (el) => {
+                                    // Method 1: Check for selected-value element (most reliable for Ant Design)
+                                    const selectedValueEl = el.querySelector('.ant-select-selection-selected-value');
+                                    if (selectedValueEl) {
+                                        const selectedText = (selectedValueEl.textContent || selectedValueEl.innerText || '').trim();
+                                        if (selectedText && selectedText.length > 0) {
+                                            return selectedText;
+                                        }
+                                        // Also try title attribute
+                                        const title = selectedValueEl.getAttribute('title');
+                                        if (title) return title;
+                                    }
+                                    
+                                    // Method 2: Check the rendered container
+                                    const rendered = el.querySelector('.ant-select-selection__rendered');
+                                    const placeholder = el.querySelector('.ant-select-selection__placeholder');
+                                    
+                                    if (rendered) {
+                                        // Check if placeholder is hidden (meaning something is selected)
+                                        let isPlaceholderHidden = false;
+                                        if (placeholder) {
+                                            const placeholderStyle = window.getComputedStyle(placeholder);
+                                            isPlaceholderHidden = placeholderStyle.display === 'none';
+                                        }
+                                        
+                                        if (isPlaceholderHidden || !placeholder) {
+                                            // Get all text from rendered
+                                            const allText = rendered.textContent || rendered.innerText || '';
+                                            // Remove placeholder text if it exists
+                                            const placeholderText = placeholder ? (placeholder.textContent || placeholder.innerText || '') : '';
+                                            const cleanText = allText.replace(placeholderText, '').trim();
+                                            
+                                            if (cleanText && !cleanText.includes('Choose an option') && cleanText.length > 0) {
+                                                return cleanText;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Method 3: Check if dropdown is open and get selected option
+                                    const dropdown = el.querySelector('.ant-select-dropdown:not(.ant-select-dropdown-hidden)');
+                                    if (dropdown) {
+                                        const selectedOption = dropdown.querySelector('.ant-select-item-selected, .ant-select-item-option-selected');
+                                        if (selectedOption) {
+                                            const optionText = (selectedOption.textContent || selectedOption.innerText || '').trim();
+                                            if (optionText) return optionText;
+                                        }
+                                    }
+                                    
+                                    // Method 4: Look for hidden input or form field
+                                    const hiddenInput = el.querySelector('input[type="hidden"]');
+                                    if (hiddenInput && hiddenInput.value) {
+                                        return hiddenInput.value;
+                                    }
+                                    
+                                    // Method 5: Check Ant Design's internal state
+                                    const antSelect = el.closest('.ant-select');
+                                    if (antSelect) {
+                                        const hiddenInput = antSelect.querySelector('input[type="hidden"]');
+                                        if (hiddenInput && hiddenInput.value) {
+                                            return hiddenInput.value;
+                                        }
+                                    }
+                                    
+                                    // Method 6: Check data attributes
+                                    return el.getAttribute('data-value') || 
+                                           el.getAttribute('value') || 
+                                           el.getAttribute('aria-label') || '';
+                                }
+                            """)
+                        if sex_value and sex_value.strip():
+                            break
+                except Exception:
+                    continue
+            
+            form_data['sexAtBirth'] = sex_value or ""
+        except Exception as e:
+            print(f"⚠️  Error capturing sexAtBirth: {e}")
+            form_data['sexAtBirth'] = ""
+        
+        return form_data
+        
+    except Exception as e:
+        print(f"⚠️  Error capturing form data: {e}")
+        return form_data
+
+
+async def save_patient_data(data, output_file="patient_data.json"):
+    """
+    Save patient data to JSON file.
+    
+    Args:
+        data: Dictionary with patient data
+        output_file: Output filename (default: "patient_data.json")
+    """
+    try:
+        # Use absolute path to ensure we save in the script directory
+        script_dir = Path(__file__).parent.absolute()
+        output_path = script_dir / output_file
+        
+        print(f"   💾 Saving to: {output_path}")
+        
+        # If file exists, load existing data and append
+        if output_path.exists():
+            try:
+                with open(output_path, 'r', encoding='utf-8') as f:
+                    existing_data = json.load(f)
+                    if isinstance(existing_data, list):
+                        existing_data.append(data)
+                        data_to_save = existing_data
+                    else:
+                        data_to_save = [existing_data, data]
+            except json.JSONDecodeError as e:
+                print(f"   ⚠️  JSON decode error, starting fresh: {e}")
+                # If file is corrupted, start fresh
+                data_to_save = [data]
+        else:
+            data_to_save = [data]
+        
+        # Add timestamp to the data
+        data['captured_at'] = datetime.now().isoformat()
+        
+        # Save to file
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(data_to_save, f, indent=2, ensure_ascii=False)
+        
+        print(f"✅ Saved patient data for {data.get('location_name', 'Unknown')}")
+        print(f"   📄 File: {output_path}")
+        print(f"   📊 Total entries: {len(data_to_save)}")
+        
+    except Exception as e:
+        print(f"❌ Error saving patient data: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+async def setup_form_monitor(page, location_id, location_name):
+    """
+    Set up JavaScript event listener to monitor form submissions.
+    
+    Args:
+        page: Playwright page object
+        location_id: Location ID from URL
+        location_name: Location name from mapping
+    """
+    
+    # Track pending patients waiting for EMR ID
+    pending_patients = []
+    
+    # Expose a Python function to JavaScript
+    async def handle_patient_submission(form_data):
+        """
+        Callback function called from JavaScript when form is submitted.
+        """
+        print(f"\n🎯 Patient form submitted detected!")
+        print(f"   Raw form data received: {form_data}")
+        
+        # Re-extract location_id from current URL in case user changed location
+        current_url = page.url
+        current_location_id = extract_location_id_from_url(current_url) or location_id
+        current_location_name = get_location_name(current_location_id)
+        
+        print(f"   Location ID: {current_location_id}")
+        print(f"   Location: {current_location_name}")
+        
+        # Add location information to the data
+        complete_data = {
+            'location_id': current_location_id,
+            'location_name': current_location_name,
+            'emr_id': '',  # Will be filled later
+            **form_data
+        }
+        
+        print(f"   Complete data to save: {complete_data}")
+        
+        # Save the data first
+        await save_patient_data(complete_data)
+        
+        # Add to pending patients list for EMR ID monitoring
+        pending_patients.append(complete_data)
+        
+        # Start background task to wait for EMR ID (as fallback)
+        asyncio.create_task(wait_for_emr_id(complete_data))
+    
+    # Expose the function to the page
+    await page.expose_function("handlePatientSubmission", handle_patient_submission)
+    
+    async def wait_for_emr_id(patient_data):
+        """
+        Wait for the EMR ID to appear in API responses.
+        Monitors network responses instead of opening the modal.
+        
+        Args:
+            patient_data: Dictionary with patient data that was just saved
+        """
+        try:
+            print(f"\n⏳ Waiting for EMR ID to be assigned via API...")
+            print(f"   Patient: {patient_data.get('legalFirstName', '')} {patient_data.get('legalLastName', '')}")
+            
+            patient_first_name = patient_data.get('legalFirstName', '').strip()
+            patient_last_name = patient_data.get('legalLastName', '').strip()
+            captured_at = patient_data.get('captured_at', '')
+            
+            # Wait for API response that contains EMR ID
+            max_wait_time = 120  # Maximum 2 minutes
+            poll_interval = 3  # Check every 3 seconds
+            elapsed_time = 0
+            
+            print(f"   🔄 Monitoring API responses for EMR ID (checking every {poll_interval} seconds, max {max_wait_time} seconds)...")
+            
+            while elapsed_time < max_wait_time:
+                try:
+                    # Check API responses for EMR ID by looking at the queue data
+                    emr_id = await page.evaluate("""
+                        (firstName, lastName) => {
+                            // Look for patient data in the DOM that might contain EMR ID
+                            // Check if there's any data attribute or text containing EMR ID
+                            const allElements = document.querySelectorAll('[data-testid*="patient"], [data-testid*="booking"]');
+                            
+                            for (const element of allElements) {
+                                const text = element.textContent || element.innerText || '';
+                                // Check if this element contains the patient name
+                                if (firstName && lastName && text.includes(firstName) && text.includes(lastName)) {
+                                    // Look for EMR ID in nearby elements or data attributes
+                                    const parent = element.closest('[class*="booking"], [class*="patient"]');
+                                    if (parent) {
+                                        const parentText = parent.textContent || parent.innerText || '';
+                                        const emrMatch = parentText.match(/EMR ID[\\s:]+(\\d+)/i);
+                                        if (emrMatch && emrMatch[1]) {
+                                            return emrMatch[1];
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            return null;
+                        }
+                    """, patient_first_name, patient_last_name)
+                    
+                    if emr_id:
+                        print(f"   ✅ EMR ID found in DOM: {emr_id}")
+                        patient_data['emr_id'] = emr_id
+                        await update_patient_emr_id(patient_data)
+                        print(f"   💾 Updated patient data with EMR ID: {emr_id}")
+                        return
+                
+                except Exception as e:
+                    print(f"   ⚠️  Error checking for EMR ID: {e}")
+                
+                await asyncio.sleep(poll_interval)
+                elapsed_time += poll_interval
+                if elapsed_time % 15 == 0:  # Print status every 15 seconds
+                    print(f"   ⏳ Still waiting for EMR ID... ({elapsed_time}s elapsed)")
+            
+            print(f"   ⚠️  EMR ID not found after {max_wait_time} seconds")
+            
+        except Exception as e:
+            print(f"   ❌ Error waiting for EMR ID: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    async def update_patient_emr_id(patient_data):
+        """
+        Update the patient data in the JSON file with the EMR ID.
+        
+        Args:
+            patient_data: Dictionary with patient data including emr_id
+        """
+        try:
+            script_dir = Path(__file__).parent.absolute()
+            output_path = script_dir / "patient_data.json"
+            
+            if not output_path.exists():
+                print(f"   ⚠️  JSON file not found, cannot update EMR ID")
+                return
+            
+            # Load existing data
+            with open(output_path, 'r', encoding='utf-8') as f:
+                existing_data = json.load(f)
+            
+            if not isinstance(existing_data, list):
+                existing_data = [existing_data]
+            
+            # Find the matching patient and update it
+            # Match by first name, last name, and timestamp (most recent match)
+            patient_first_name = patient_data.get('legalFirstName', '').strip()
+            patient_last_name = patient_data.get('legalLastName', '').strip()
+            captured_at = patient_data.get('captured_at', '')
+            
+            updated = False
+            for entry in existing_data:
+                entry_first = entry.get('legalFirstName', '').strip()
+                entry_last = entry.get('legalLastName', '').strip()
+                entry_time = entry.get('captured_at', '')
+                
+                # Match by name and if EMR ID is not already set
+                if (entry_first == patient_first_name and 
+                    entry_last == patient_last_name and 
+                    not entry.get('emr_id') and
+                    entry_time == captured_at):
+                    entry['emr_id'] = patient_data.get('emr_id', '')
+                    updated = True
+                    break
+            
+            # If no match found, add it as a new entry or update the most recent one
+            if not updated and existing_data:
+                # Update the most recent entry that doesn't have an EMR ID
+                for entry in reversed(existing_data):
+                    if not entry.get('emr_id'):
+                        entry['emr_id'] = patient_data.get('emr_id', '')
+                        updated = True
+                        break
+            
+            if updated:
+                # Save updated data
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    json.dump(existing_data, f, indent=2, ensure_ascii=False)
+                print(f"   ✅ Updated JSON file with EMR ID")
+            else:
+                print(f"   ⚠️  Could not find matching patient entry to update")
+                
+        except Exception as e:
+            print(f"   ❌ Error updating EMR ID in JSON: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Set up a background task to periodically check for form submissions
+    async def monitor_form_submissions():
+        """Background task that polls for form submissions"""
+        last_captured = None
+        while True:
+            try:
+                await asyncio.sleep(0.5)  # Check every 500ms
+                
+                # Check if modal is visible
+                modal_visible = await page.evaluate("""
+                    () => {
+                        const modal = document.querySelector('[role="dialog"], .modal, [class*="Modal"], [class*="modal"]');
+                        return modal && window.getComputedStyle(modal).display !== 'none';
+                    }
+                """)
+                
+                if modal_visible:
+                    # Try to capture form data
+                    form_data = await capture_form_data(page)
+                    
+                    # Check if we have new data (at least one field filled)
+                    if any(v and v.strip() for v in form_data.values() if v):
+                        # Create a hash of the data to detect changes
+                        data_hash = str(sorted(form_data.items()))
+                        
+                        if data_hash != last_captured:
+                            # Check if form is being submitted (button might be disabled/loading)
+                            is_submitting = await page.evaluate("""
+                                () => {
+                                    const button = document.querySelector('[data-testid="addPatientSubmitButton"]') ||
+                                                   document.querySelector('button[data-testid*="addPatient"]') ||
+                                                   document.querySelector('button[type="submit"]');
+                                    if (!button) return false;
+                                    const modal = button.closest('[role="dialog"], .modal, [class*="Modal"]');
+                                    return modal && (button.disabled || button.getAttribute('aria-busy') === 'true');
+                                }
+                            """)
+                            
+                            # If button is in submitting state, capture the data
+                            if is_submitting:
+                                print(f"\n🔄 Form submission detected via polling!")
+                                last_captured = data_hash
+                                await handle_patient_submission(form_data)
+            except Exception as e:
+                # Silently continue on errors
+                pass
+    
+    # Start the background monitoring task
+    asyncio.create_task(monitor_form_submissions())
+    print("✅ Background form monitoring started")
+    
+    # Intercept network responses to catch EMR ID from API calls
+    async def handle_response(response):
+        """Intercept API responses to extract EMR ID"""
+        try:
+            url = response.url
+            status = response.status
+            
+            # Look for API responses that might contain patient/booking data with EMR ID
+            # Check a wider range of URLs, especially booking endpoints
+            url_lower = url.lower()
+            is_relevant = (
+                status == 200 and (
+                    "patient" in url_lower or 
+                    "booking" in url_lower or 
+                    "bookings" in url_lower or
+                    "queue" in url_lower or 
+                    "appointment" in url_lower or
+                    "appointments" in url_lower or
+                    "facesheet" in url_lower or
+                    "visit" in url_lower or
+                    "/api/" in url_lower or
+                    "api-manage.solvhealth.com" in url_lower
+                )
+            )
+            
+            if is_relevant:
+                try:
+                    # Try to get JSON response
+                    response_body = await response.json()
+                    
+                    # First, check for the specific booking API structure
+                    # EMR ID is in: data.integration_status[0].emr_id or data.patient_match_details.external_user_profile_id
+                    emr_id = None
+                    patient_match = None
+                    booking_data = None
+                    all_patients = []
+                    
+                    # Check if this is a booking API response
+                    if isinstance(response_body, dict) and 'data' in response_body:
+                        booking_data = response_body.get('data', {})
+                        
+                        # Method 1: Check integration_status array for emr_id
+                        integration_status = booking_data.get('integration_status', [])
+                        if isinstance(integration_status, list) and len(integration_status) > 0:
+                            for integration in integration_status:
+                                if isinstance(integration, dict):
+                                    integration_emr_id = integration.get('emr_id')
+                                    if integration_emr_id:
+                                        emr_id = str(integration_emr_id).strip()
+                                        patient_match = booking_data
+                                        print(f"   📍 Found EMR ID in integration_status: {emr_id}")
+                                        break
+                        
+                        # Method 2: Check patient_match_details for external_user_profile_id (which is the EMR ID)
+                        if not emr_id:
+                            patient_match_details = booking_data.get('patient_match_details', {})
+                            if isinstance(patient_match_details, dict):
+                                external_user_profile_id = patient_match_details.get('external_user_profile_id')
+                                if external_user_profile_id:
+                                    emr_id = str(external_user_profile_id).strip()
+                                    patient_match = booking_data
+                                    print(f"   📍 Found EMR ID in patient_match_details: {emr_id}")
+                    
+                    # If not found in booking structure, recursively search
+                    if not emr_id:
+                        all_patients = []
+                        
+                        def find_emr_id(data, path=""):
+                            nonlocal emr_id, patient_match, all_patients
+                            if isinstance(data, dict):
+                                # Check for EMR ID fields (various possible field names)
+                                for key, value in data.items():
+                                    key_lower = str(key).lower()
+                                    if ("emr" in key_lower or "emr_id" in key_lower or "emrid" in key_lower) and isinstance(value, (str, int)):
+                                        if value and str(value).strip():
+                                            emr_id = str(value).strip()
+                                            patient_match = data
+                                            return
+                                    
+                                    # Collect patient-like objects
+                                    if isinstance(value, dict):
+                                        # Check if this looks like a patient object
+                                        if any(k in str(value.keys()).lower() for k in ['first', 'last', 'name', 'patient']):
+                                            all_patients.append(value)
+                                        find_emr_id(value, f"{path}.{key}")
+                                    elif isinstance(value, list):
+                                        find_emr_id(value, path)
+                            elif isinstance(data, list):
+                                for item in data:
+                                    find_emr_id(item, path)
+                        
+                        find_emr_id(response_body)
+                    
+                    # If we found EMR ID, try to match with pending patients
+                    if emr_id:
+                        print(f"\n🌐 API response contains EMR ID: {emr_id}")
+                        print(f"   URL: {url}")
+                        
+                        # Try to extract patient info from the matched data
+                        patient_first_name = ''
+                        patient_last_name = ''
+                        
+                        if patient_match:
+                            # Extract patient name from booking data structure
+                            patient_first_name = (
+                                patient_match.get('first_name') or
+                                patient_match.get('firstName') or 
+                                patient_match.get('legalFirstName') or 
+                                patient_match.get('firstname') or
+                                ''
+                            )
+                            patient_last_name = (
+                                patient_match.get('last_name') or
+                                patient_match.get('lastName') or 
+                                patient_match.get('legalLastName') or 
+                                patient_match.get('lastname') or
+                                ''
+                            )
+                            
+                            # Also try to get booking ID for matching
+                            booking_id = patient_match.get('id') or ''
+                        
+                        # Also check all_patients if we didn't get names from patient_match
+                        if not patient_first_name and all_patients:
+                            for p in all_patients:
+                                if emr_id in str(p.values()):
+                                    patient_first_name = (
+                                        p.get('firstName') or 
+                                        p.get('legalFirstName') or 
+                                        p.get('first_name') or ''
+                                    )
+                                    patient_last_name = (
+                                        p.get('lastName') or 
+                                        p.get('legalLastName') or 
+                                        p.get('last_name') or ''
+                                    )
+                                    if patient_first_name or patient_last_name:
+                                        break
+                        
+                        if patient_first_name or patient_last_name:
+                            print(f"   Patient: {patient_first_name} {patient_last_name}")
+                        
+                        # Find matching pending patient
+                        matched = False
+                        for pending in list(pending_patients):  # Use list() to avoid modification during iteration
+                            if pending.get('emr_id'):
+                                continue  # Skip if already has EMR ID
+                            
+                            pending_first = pending.get('legalFirstName', '').strip()
+                            pending_last = pending.get('legalLastName', '').strip()
+                            
+                            # Match by name (case insensitive)
+                            name_match = False
+                            if patient_first_name and patient_last_name:
+                                name_match = (
+                                    pending_first.lower() == patient_first_name.lower().strip() and 
+                                    pending_last.lower() == patient_last_name.lower().strip()
+                                )
+                            elif patient_first_name:
+                                name_match = pending_first.lower() == patient_first_name.lower().strip()
+                            elif patient_last_name:
+                                name_match = pending_last.lower() == patient_last_name.lower().strip()
+                            
+                            # Also check if phone numbers match (additional verification)
+                            phone_match = False
+                            if booking_data:
+                                api_phone = booking_data.get('phone', '').strip()
+                                pending_phone = pending.get('mobilePhone', '').strip()
+                                if api_phone and pending_phone:
+                                    # Normalize phone numbers (remove +, spaces, dashes)
+                                    api_phone_norm = api_phone.replace('+', '').replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
+                                    pending_phone_norm = pending_phone.replace('+', '').replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
+                                    if api_phone_norm and pending_phone_norm and api_phone_norm == pending_phone_norm:
+                                        phone_match = True
+                            
+                            # Match if name matches OR (phone matches and we have at least partial name match)
+                            final_match = name_match or (phone_match and (patient_first_name or patient_last_name))
+                            
+                            # If no match but we have only one pending patient without EMR ID, use it
+                            if not final_match and len([p for p in pending_patients if not p.get('emr_id')]) == 1:
+                                final_match = True
+                            
+                            if final_match:
+                                print(f"   ✅ Matched with pending patient!")
+                                if name_match:
+                                    print(f"      Match by name: {pending_first} {pending_last}")
+                                if phone_match:
+                                    print(f"      Match by phone: {pending_phone}")
+                                pending['emr_id'] = emr_id
+                                if booking_id:
+                                    pending['booking_id'] = booking_id
+                                await update_patient_emr_id(pending)
+                                print(f"   💾 Updated patient data with EMR ID: {emr_id}")
+                                # Remove from pending list
+                                pending_patients.remove(pending)
+                                matched = True
+                                break
+                        
+                        if not matched and pending_patients:
+                            print(f"   ⚠️  EMR ID found but no matching patient. Pending patients: {len(pending_patients)}")
+                            # Try to update the most recent pending patient without EMR ID
+                            for pending in reversed(pending_patients):
+                                if not pending.get('emr_id'):
+                                    print(f"   📝 Assigning EMR ID to most recent pending patient")
+                                    pending['emr_id'] = emr_id
+                                    await update_patient_emr_id(pending)
+                                    print(f"   💾 Updated patient data with EMR ID: {emr_id}")
+                                    pending_patients.remove(pending)
+                                    break
+                
+                except Exception as e:
+                    # Not JSON or can't parse, skip silently
+                    pass
+                    
+        except Exception as e:
+            # Ignore errors in response handler
+            pass
+    
+    # Set up response interception
+    page.on("response", handle_response)
+    print("✅ API response interception enabled")
+    print(f"   📡 Actively monitoring all API responses for EMR ID...")
+    
+    # Also set up periodic DOM checking as active backup
+    async def actively_check_dom_for_emr():
+        """Periodically check DOM for EMR IDs that might have appeared"""
+        while True:
+            try:
+                await asyncio.sleep(5)  # Check every 5 seconds
+                
+                if not pending_patients:
+                    continue
+                
+                # Check the queue list for EMR IDs
+                for pending in list(pending_patients):
+                    if pending.get('emr_id'):
+                        continue
+                    
+                    pending_first = pending.get('legalFirstName', '').strip()
+                    pending_last = pending.get('legalLastName', '').strip()
+                    
+                    if not pending_first and not pending_last:
+                        continue
+                    
+                    # Look for patient in DOM and check for EMR ID
+                    emr_id = await page.evaluate("""
+                        (firstName, lastName) => {
+                            // Find patient name elements
+                            const nameElements = document.querySelectorAll('[data-testid^="booking-patient-name-"]');
+                            
+                            for (const nameEl of nameElements) {
+                                const text = nameEl.textContent || nameEl.innerText || '';
+                                if (text.includes(firstName) && text.includes(lastName)) {
+                                    // Look for EMR ID in the parent container
+                                    const container = nameEl.closest('[class*="booking"], [class*="patient"], [data-testid*="booking"]');
+                                    if (container) {
+                                        const containerText = container.textContent || container.innerText || '';
+                                        const emrMatch = containerText.match(/EMR ID[\\s:]+(\\d+)/i);
+                                        if (emrMatch && emrMatch[1]) {
+                                            return emrMatch[1];
+                                        }
+                                    }
+                                }
+                            }
+                            return null;
+                        }
+                    """, pending_first, pending_last)
+                    
+                    if emr_id:
+                        print(f"\n🔍 Found EMR ID in DOM: {emr_id}")
+                        print(f"   Patient: {pending_first} {pending_last}")
+                        pending['emr_id'] = emr_id
+                        await update_patient_emr_id(pending)
+                        print(f"   💾 Updated patient data with EMR ID: {emr_id}")
+                        pending_patients.remove(pending)
+            
+            except Exception as e:
+                # Silently continue on errors
+                pass
+    
+    # Start active DOM monitoring
+    asyncio.create_task(actively_check_dom_for_emr())
+    print("✅ Active DOM monitoring started (checking every 5 seconds)")
+    
+    # Inject JavaScript to monitor the submit button
+    monitor_script = """
+    (function() {
+        console.log('🔍 Setting up patient form monitor...');
+        
+        let isMonitoring = false;
+        const monitoredButtons = new WeakSet();
+        
+        // Function to capture form data
+        function captureFormData() {
+            const formData = {};
+            
+            // First, try to capture the selected location from dropdown (if visible in modal)
+            // Look for location dropdown in the modal
+            const locationSelectors = [
+                'select[name*="location"]',
+                'select[id*="location"]',
+                '[name*="location"]',
+                '[id*="location"]',
+                '[data-testid*="location"]',
+                'select',
+                '[role="combobox"]'
+            ];
+            
+            // Find modal/dialog first
+            const modal = document.querySelector('[role="dialog"], .modal, [class*="Modal"], [class*="modal"]');
+            if (modal) {
+                for (const selector of locationSelectors) {
+                    try {
+                        const element = modal.querySelector(selector);
+                        if (element) {
+                            const style = window.getComputedStyle(element);
+                            if (style.display !== 'none' && style.visibility !== 'hidden') {
+                                let locationValue = '';
+                                if (element.tagName.toLowerCase() === 'select') {
+                                    locationValue = element.value || '';
+                                } else {
+                                    locationValue = element.value || element.textContent || element.innerText || '';
+                                    const selected = element.querySelector('[selected], [aria-selected="true"], [class*="selected"]');
+                                    if (selected) {
+                                        locationValue = selected.value || selected.textContent || selected.innerText || locationValue;
+                                    }
+                                }
+                                if (locationValue && locationValue.trim()) {
+                                    formData.selectedLocation = locationValue;
+                                    break;
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        continue;
+                    }
+                }
+            }
+            
+            // Capture text fields - using actual field names and test IDs from the HTML
+            const fieldMappings = [
+                { key: 'legalFirstName', selectors: ['[name="firstName"]', '[data-testid="addPatientFirstName"]', 'input[name="firstName"]'] },
+                { key: 'legalLastName', selectors: ['[name="lastName"]', '[data-testid="addPatientLastName"]', 'input[name="lastName"]'] },
+                { key: 'mobilePhone', selectors: ['[data-testid="addPatientMobilePhone"]', '[name="phone"]', 'input[type="tel"][data-testid*="Phone"]'] },
+                { key: 'dob', selectors: ['[data-testid="addPatientDob"]', '[name="birthDate"]', 'input[placeholder*="MM/DD/YYYY"]'] },
+                { key: 'reasonForVisit', selectors: ['[name="reasonForVisit"]', '[data-testid*="addPatientReasonForVisit"]', '[id="reasonForVisit"]', '[data-testid="addPatientReasonForVisit-0"]', 'input[name="reasonForVisit"]'] }
+            ];
+            
+            fieldMappings.forEach(field => {
+                let value = '';
+                for (const selector of field.selectors) {
+                    try {
+                        const element = document.querySelector(selector);
+                        if (element) {
+                            const style = window.getComputedStyle(element);
+                            if (style.display !== 'none' && style.visibility !== 'hidden') {
+                                value = element.value || element.textContent || '';
+                                if (value && value.trim()) break;
+                            }
+                        }
+                    } catch (e) {
+                        continue;
+                    }
+                }
+                formData[field.key] = value || '';
+            });
+            
+            // Capture sexAtBirth dropdown - using actual field name "birthSex"
+            const sexSelectors = [
+                '#birthSex',
+                '[id="birthSex"]',
+                '[name="birthSex"]',
+                '[data-testid*="birthSex"]',
+                '[data-testid*="sex"]',
+                'select[name="birthSex"]',
+                'select[id="birthSex"]'
+            ];
+            
+            let sexValue = '';
+            for (const selector of sexSelectors) {
+                try {
+                    const element = document.querySelector(selector);
+                    if (element) {
+                        const style = window.getComputedStyle(element);
+                        if (style.display !== 'none' && style.visibility !== 'hidden') {
+                            if (element.tagName.toLowerCase() === 'select') {
+                                sexValue = element.value || '';
+                            } else {
+                                // For Ant Design custom dropdowns, check the selection
+                                // Method 1: Check for selected-value element (most reliable)
+                                const selectedValueEl = element.querySelector('.ant-select-selection-selected-value');
+                                if (selectedValueEl) {
+                                    sexValue = (selectedValueEl.textContent || selectedValueEl.innerText || '').trim();
+                                    if (sexValue) {
+                                        // Also try title attribute
+                                        const title = selectedValueEl.getAttribute('title');
+                                        if (title) sexValue = title;
+                                        break;
+                                    }
+                                }
+                                
+                                // Method 2: Check the rendered container
+                                const rendered = element.querySelector('.ant-select-selection__rendered');
+                                const placeholder = element.querySelector('.ant-select-selection__placeholder');
+                                
+                                if (rendered) {
+                                    // Check if placeholder is hidden (meaning something is selected)
+                                    let isPlaceholderHidden = false;
+                                    if (placeholder) {
+                                        const placeholderStyle = window.getComputedStyle(placeholder);
+                                        isPlaceholderHidden = placeholderStyle.display === 'none';
+                                    }
+                                    
+                                    if (isPlaceholderHidden || !placeholder) {
+                                        // Get all text from rendered
+                                        const allText = rendered.textContent || rendered.innerText || '';
+                                        // Remove placeholder text if it exists
+                                        const placeholderText = placeholder ? (placeholder.textContent || placeholder.innerText || '') : '';
+                                        const cleanText = allText.replace(placeholderText, '').trim();
+                                        
+                                        if (cleanText && !cleanText.includes('Choose an option') && cleanText.length > 0) {
+                                            sexValue = cleanText;
+                                            if (sexValue) break;
+                                        }
+                                    }
+                                }
+                                
+                                // Method 3: Check if dropdown is open and get selected option
+                                const dropdown = element.querySelector('.ant-select-dropdown:not(.ant-select-dropdown-hidden)');
+                                if (dropdown) {
+                                    const selectedOption = dropdown.querySelector('.ant-select-item-selected, .ant-select-item-option-selected');
+                                    if (selectedOption) {
+                                        sexValue = (selectedOption.textContent || selectedOption.innerText || '').trim();
+                                        if (sexValue) break;
+                                    }
+                                }
+                                
+                                // Method 4: Look for hidden input
+                                const hiddenInput = element.querySelector('input[type="hidden"]');
+                                if (hiddenInput && hiddenInput.value) {
+                                    sexValue = hiddenInput.value;
+                                    if (sexValue) break;
+                                }
+                                
+                                // Method 5: Check Ant Design's internal state
+                                const antSelect = element.closest('.ant-select');
+                                if (antSelect) {
+                                    const hiddenInput = antSelect.querySelector('input[type="hidden"]');
+                                    if (hiddenInput && hiddenInput.value) {
+                                        sexValue = hiddenInput.value;
+                                        if (sexValue) break;
+                                    }
+                                }
+                                
+                                // Method 6: Check data attributes
+                                sexValue = element.getAttribute('data-value') || 
+                                          element.getAttribute('value') || 
+                                          element.getAttribute('aria-label') || '';
+                                if (sexValue) break;
+                            }
+                            if (sexValue && sexValue.trim()) break;
+                        }
+                    }
+                } catch (e) {
+                    continue;
+                }
+            }
+            formData.sexAtBirth = sexValue || '';
+            
+            return formData;
+        }
+        
+        // Function to check if form is visible (has input fields)
+        function isFormVisible() {
+            const formFields = [
+                '[name="firstName"]',
+                '[data-testid="addPatientFirstName"]',
+                '[name="lastName"]',
+                '[data-testid="addPatientLastName"]',
+                '[data-testid="addPatientMobilePhone"]',
+                '[data-testid="addPatientDob"]'
+            ];
+            for (const selector of formFields) {
+                try {
+                    const element = document.querySelector(selector);
+                    if (element) {
+                        const style = window.getComputedStyle(element);
+                        if (style.display !== 'none' && style.visibility !== 'hidden') {
+                            return true;
+                        }
+                    }
+                } catch (e) {
+                    continue;
+                }
+            }
+            return false;
+        }
+        
+        // Function to setup button listener
+        function setupButtonListener() {
+            // Try to find the submit button - prioritize the specific testid
+            // Look for buttons with text "Add" or submit buttons in modal
+            const buttonSelectors = [
+                '[data-testid="addPatientSubmitButton"]',
+                'button[data-testid*="addPatient"][data-testid*="Submit"]',
+                'button[data-testid*="addPatient"]',
+                'button[data-testid*="submit"]',
+                'button[data-testid*="Add"]'
+            ];
+            
+            let submitButton = null;
+            
+            // First try specific selectors
+            for (const selector of buttonSelectors) {
+                try {
+                    const buttons = document.querySelectorAll(selector);
+                    if (buttons.length > 0) {
+                        // Find the one that's visible and in a modal
+                        for (const btn of buttons) {
+                            const style = window.getComputedStyle(btn);
+                            if (style.display !== 'none' && style.visibility !== 'hidden') {
+                                // Check if it's in a modal/dialog
+                                const modal = btn.closest('[role="dialog"], .modal, [class*="Modal"], [class*="modal"]');
+                                if (modal) {
+                                    submitButton = btn;
+                                    break;
+                                }
+                            }
+                        }
+                        if (submitButton) break;
+                    }
+                } catch (e) {
+                    continue;
+                }
+            }
+            
+            // If not found, look for buttons with text "Add" in modal
+            if (!submitButton) {
+                try {
+                    const modal = document.querySelector('[role="dialog"], .modal, [class*="Modal"], [class*="modal"]');
+                    if (modal) {
+                        const buttons = modal.querySelectorAll('button');
+                        for (const btn of buttons) {
+                            const style = window.getComputedStyle(btn);
+                            if (style.display !== 'none' && style.visibility !== 'hidden') {
+                                const text = (btn.textContent || btn.innerText || '').trim();
+                                // Look for buttons with "Add" text (but not "Add Patient" which is the opener)
+                                if (text && text.toLowerCase().includes('add') && 
+                                    !text.toLowerCase().includes('patient') &&
+                                    text.length < 20) {
+                                    submitButton = btn;
+                                    break;
+                                }
+                                // Also check for submit type buttons
+                                if (btn.type === 'submit' || btn.getAttribute('type') === 'submit') {
+                                    submitButton = btn;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {
+                    // Ignore errors
+                }
+            }
+            
+            if (submitButton && !monitoredButtons.has(submitButton)) {
+                console.log('✅ Found submit button, setting up listener');
+                console.log('   Button text:', submitButton.textContent || submitButton.innerText);
+                
+                // Mark as monitored
+                monitoredButtons.add(submitButton);
+                
+                // Add multiple listeners to ensure we catch it
+                const captureAndSend = async function(e) {
+                    console.log('🖱️  Submit button clicked!');
+                    
+                    // Capture immediately, don't wait
+                    const formData = captureFormData();
+                    console.log('📋 Captured form data:', formData);
+                    
+                    // Send to Python immediately
+                    try {
+                        await window.handlePatientSubmission(formData);
+                    } catch (error) {
+                        console.error('❌ Error calling handlePatientSubmission:', error);
+                    }
+                };
+                
+                // Add listener with capture phase (fires first)
+                submitButton.addEventListener('click', captureAndSend, true);
+                // Also add normal listener as backup
+                submitButton.addEventListener('click', captureAndSend, false);
+                // Also intercept mousedown (fires before click)
+                submitButton.addEventListener('mousedown', captureAndSend, true);
+                
+                return true;
+            }
+            
+            return false;
+        }
+        
+        // Try to setup listener immediately
+        setupButtonListener();
+        
+        // Use MutationObserver to watch for dynamically added buttons and modals
+        const observer = new MutationObserver(function(mutations) {
+            // Check for new buttons
+            setupButtonListener();
+        });
+        
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['data-testid', 'class', 'style']
+        });
+        
+        // Also listen for form submit events as a fallback (non-blocking)
+        document.addEventListener('submit', async function(e) {
+            const form = e.target;
+            if (form) {
+                // Check if this form is in a modal and contains patient form fields
+                const modal = form.closest('[role="dialog"], .modal, [class*="Modal"], [class*="modal"]');
+                if (modal) {
+                    // Check if form has patient-related fields
+                    const hasPatientFields = form.querySelector('[name="legalFirstName"], [id="legalFirstName"], [data-testid="legalFirstName"]') ||
+                                           form.querySelector('[name="legalLastName"], [id="legalLastName"], [data-testid="legalLastName"]');
+                    
+                    if (hasPatientFields) {
+                        console.log('📝 Form submit event detected in modal!');
+                        
+                        // Small delay to capture data (don't block submission)
+                        setTimeout(async () => {
+                            const formData = captureFormData();
+                            console.log('📋 Captured form data:', formData);
+                            
+                            try {
+                                await window.handlePatientSubmission(formData);
+                            } catch (error) {
+                                console.error('❌ Error calling handlePatientSubmission:', error);
+                            }
+                        }, 100);
+                    }
+                }
+            }
+        }, false); // Don't use capture phase, let form submit normally
+        
+        // Periodic check for buttons (in case MutationObserver misses something)
+        setInterval(() => {
+            setupButtonListener();
+        }, 1000); // Check every second
+        
+        // Also log when modals appear
+        const modalObserver = new MutationObserver(function(mutations) {
+            const modal = document.querySelector('[role="dialog"], .modal, [class*="Modal"], [class*="modal"]');
+            if (modal) {
+                console.log('📦 Modal detected, checking for buttons...');
+                setupButtonListener();
+            }
+        });
+        
+        modalObserver.observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+        
+        console.log('✅ Patient form monitor initialized');
+        console.log('🔍 Monitoring for form submissions...');
+    })();
+    """
+    
+    # Inject the monitoring script
+    await page.evaluate(monitor_script)
+    print("✅ Form monitor script injected")
+    
+    # Also set up console message listener to see JavaScript logs
+    def handle_console(msg):
+        if "Patient form" in msg.text or "Submit button" in msg.text or "Form submit" in msg.text or "Captured form" in msg.text:
+            print(f"   [JS Console] {msg.text}")
+    
+    page.on("console", handle_console)
+
+
+async def main():
+    """
+    Main function to run the patient form monitor.
+    """
+    url = "https://manage.solvhealth.com/queue?location_ids=AXjwbE"
+    
+    # Extract location_id from URL
+    location_id = extract_location_id_from_url(url) or DEFAULT_LOCATION_ID
+    location_name = get_location_name(location_id)
+    
+    print("=" * 60)
+    print("🏥 Patient Form Monitor")
+    print("=" * 60)
+    print(f"📍 URL: {url}")
+    print(f"📍 Location ID: {location_id}")
+    print(f"📍 Location Name: {location_name}")
+    print("=" * 60)
+    print("\n🔍 Listening for patient submissions...")
+    print("   (The browser will open in non-headless mode)")
+    print("   (Click 'Add Patient' and submit the form to capture data)")
+    print("   (Press Ctrl+C to stop)\n")
+    
+    async with async_playwright() as p:
+        # Launch browser in non-headless mode
+        browser = await p.chromium.launch(headless=False)
+        context = await browser.new_context()
+        page = await context.new_page()
+        
+        try:
+            # Navigate to the page with a less strict wait condition
+            print(f"🌐 Navigating to {url}...")
+            try:
+                # Try with domcontentloaded first (faster, less strict)
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                print("✅ Page loaded (DOM ready)")
+            except PlaywrightTimeoutError:
+                # If that times out, try with just load
+                try:
+                    await page.goto(url, wait_until="load", timeout=30000)
+                    print("✅ Page loaded (load event)")
+                except PlaywrightTimeoutError:
+                    # Even if timeout, continue - the page might still be usable
+                    print("⚠️  Page navigation timeout, but continuing anyway...")
+                    print("   (The page may still be loading, but monitoring will start)")
+            
+            # Wait a bit for the page to fully initialize and any modals to be ready
+            print("⏳ Waiting for page to initialize...")
+            await asyncio.sleep(3)
+            
+            # Setup form monitor
+            print("🔧 Setting up form monitor...")
+            await setup_form_monitor(page, location_id, location_name)
+            
+            # Keep the script running indefinitely
+            print("\n⏳ Monitoring... (Press Ctrl+C to stop)")
+            print("   📝 Instructions:")
+            print("      1. Click 'Add Patient' button (modal will open)")
+            print("      2. Select location from dropdown in the modal")
+            print("      3. Fill out the form fields that appear")
+            print("      4. Click 'Add' button to submit")
+            print("      5. Form data will be captured and saved automatically\n")
+            while True:
+                await asyncio.sleep(1)
+                
+        except KeyboardInterrupt:
+            print("\n\n🛑 Stopping monitor...")
+        except Exception as e:
+            print(f"\n❌ Error: {e}")
+        finally:
+            await browser.close()
+            print("👋 Browser closed. Goodbye!")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+

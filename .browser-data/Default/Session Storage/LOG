@@ -1,0 +1,17 @@
+2025/11/06-18:38:00.728 85e8e Creating DB /Users/biruktsegaye/Documents/playwright-test-python/.browser-data/Default/Session Storage since it was missing.
+2025/11/06-18:38:00.734 85e8e Reusing MANIFEST /Users/biruktsegaye/Documents/playwright-test-python/.browser-data/Default/Session Storage/MANIFEST-000001
+2025/11/06-18:40:01.803 8695a Level-0 table #5: started
+2025/11/06-18:40:01.811 8695a Level-0 table #5: 39618 bytes OK
+2025/11/06-18:40:01.816 8695a Delete type=0 #3
+2025/11/06-18:41:01.803 85e8e Level-0 table #7: started
+2025/11/06-18:41:01.810 85e8e Level-0 table #7: 34730 bytes OK
+2025/11/06-18:41:01.831 85e8e Delete type=0 #4
+2025/11/06-18:42:04.396 85e92 Level-0 table #9: started
+2025/11/06-18:42:04.400 85e92 Level-0 table #9: 35085 bytes OK
+2025/11/06-18:42:04.403 85e92 Delete type=0 #6
+2025/11/06-18:44:36.637 85e92 Level-0 table #11: started
+2025/11/06-18:44:36.640 85e92 Level-0 table #11: 34731 bytes OK
+2025/11/06-18:44:36.644 85e92 Delete type=0 #8
+2025/11/06-18:46:36.639 85e92 Level-0 table #13: started
+2025/11/06-18:46:36.642 85e92 Level-0 table #13: 35195 bytes OK
+2025/11/06-18:46:36.645 85e92 Delete type=0 #10
